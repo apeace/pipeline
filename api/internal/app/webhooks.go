@@ -244,12 +244,28 @@ func processZendeskEvent(ctx context.Context, db *sql.DB, orgID, eventType strin
 	}
 
 	switch eventType {
-	case "zen:event-type:ticket.created", "zen:event-type:ticket.updated":
+	case "zen:event-type:ticket.created",
+		"zen:event-type:ticket.updated",
+		"zen:event-type:ticket.subject_changed",
+		"zen:event-type:ticket.description_changed",
+		"zen:event-type:ticket.agent_assignment_changed",
+		"zen:event-type:ticket.merged":
 		var d webhookTicketDetail
 		if err := json.Unmarshal(envelope.Detail, &d); err != nil {
 			return fmt.Errorf("unmarshal ticket detail: %w", err)
 		}
 		return handleTicketUpsert(ctx, db, orgID, &d, limiter)
+
+	case "zen:event-type:ticket.comment_added", "zen:event-type:messaging_ticket.message_added":
+		// Comment data in these events is incomplete (no html_body, no created_at),
+		// so sync all comments from the REST API to get full fidelity data.
+		var d struct {
+			ID flexInt64 `json:"id"`
+		}
+		if err := json.Unmarshal(envelope.Detail, &d); err != nil {
+			return fmt.Errorf("unmarshal ticket detail: %w", err)
+		}
+		return handleTicketCommentAdded(ctx, db, orgID, d.ID, limiter)
 
 	case "zen:event-type:ticket.status_changed":
 		var d webhookTicketDetail
@@ -258,7 +274,9 @@ func processZendeskEvent(ctx context.Context, db *sql.DB, orgID, eventType strin
 		}
 		return handleTicketStatusChanged(ctx, db, orgID, &d)
 
-	case "zen:event-type:ticket.deleted":
+	case "zen:event-type:ticket.deleted",
+		"zen:event-type:ticket.soft_deleted",
+		"zen:event-type:ticket.permanently_deleted":
 		var d webhookTicketDeletedDetail
 		if err := json.Unmarshal(envelope.Detail, &d); err != nil {
 			return fmt.Errorf("unmarshal ticket deleted detail: %w", err)
@@ -452,6 +470,30 @@ func handleTicketStatusChanged(ctx context.Context, db *sql.DB, orgID string, d 
 	}
 
 	return tx.Commit()
+}
+
+func handleTicketCommentAdded(ctx context.Context, db *sql.DB, orgID string, zendeskTicketID flexInt64, limiter *ratelimit.Limiter) error {
+	// Ensure the ticket exists; fetch from Zendesk if we haven't seen it yet.
+	var exists bool
+	if err := db.QueryRowContext(ctx,
+		`SELECT EXISTS(SELECT 1 FROM tickets WHERE org_id = $1 AND zendesk_ticket_id = $2)`,
+		orgID, zendeskTicketID,
+	).Scan(&exists); err != nil {
+		return fmt.Errorf("look up ticket: %w", err)
+	}
+	if !exists {
+		ticket, fetchErr := fetchZendeskTicket(ctx, db, orgID, zendeskTicketID, limiter)
+		if fetchErr != nil {
+			return fmt.Errorf("fetch ticket %d: %w", zendeskTicketID, fetchErr)
+		}
+		if ticket == nil {
+			return fmt.Errorf("ticket %d not found and Zendesk credentials not configured", zendeskTicketID)
+		}
+		if upsertErr := handleTicketUpsert(ctx, db, orgID, ticket, limiter); upsertErr != nil {
+			return fmt.Errorf("upsert fetched ticket %d: %w", zendeskTicketID, upsertErr)
+		}
+	}
+	return syncTicketComments(ctx, db, orgID, zendeskTicketID, limiter)
 }
 
 // ── Web chat parsing ──────────────────────────────────────────────────────────
