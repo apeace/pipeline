@@ -159,7 +159,8 @@ function toTicket(raw: AppTicketRow): Ticket {
     subscription: { status: "active", id: "", plan: "" },
     tags: [],
     temperature: "warm",
-    aiTitle: t.ai_title ?? undefined,
+    // Filter out the example title that the LLM sometimes echoes from the prompt.
+    aiTitle: t.ai_title === "Login issue with SSO" ? undefined : (t.ai_title ?? undefined),
     aiSummary: t.ai_summary ?? undefined,
     aiTemperature: t.ai_temperature ?? undefined,
     assignee: t.assignee_name ?? "Unassigned",
